@@ -66,6 +66,10 @@ NUM_LOCAL_VOLUMES = {
     'Standard_L80s_v2': 10
 }
 
+# https://docs.microsoft.com/en-us/azure/virtual-machines/windows/scheduled-events
+_SCHEDULED_EVENTS_CMD = ('curl -H Metadata:true http://169.254.169.254/metadata'
+                         '/scheduledevents?api-version=2019-01-01')
+
 
 class AzureVmSpec(virtual_machine.BaseVmSpec):
   """Object containing the information needed to create a AzureVirtualMachine.
@@ -753,7 +757,10 @@ class AzureVirtualMachine(
   def UpdateInterruptibleVmStatus(self):
     """Updates the interruptible status if the VM was preempted."""
     if self.low_priority:
-      self.early_termination = True
+      stdout, _, = self.RemoteCommand(_SCHEDULED_EVENTS_CMD)
+      events = json.loads(stdout).get('Events', [])
+      self.early_termination = any(
+          event.get('EventType') == 'Preempt' for event in events)
 
   def IsInterruptible(self):
     """Returns whether this vm is a interruptible vm (e.g. spot, preemptible).

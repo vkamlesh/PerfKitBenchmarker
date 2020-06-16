@@ -29,7 +29,6 @@ from __future__ import division
 from __future__ import print_function
 
 import collections
-import copy
 import itertools
 import json
 import logging
@@ -66,6 +65,9 @@ _INSUFFICIENT_HOST_CAPACITY = ('does not have enough resources available '
                                'to fulfill the request.')
 _GCE_VM_CREATE_TIMEOUT = 600
 _GCE_NVIDIA_GPU_PREFIX = 'nvidia-tesla-'
+_SHUTDOWN_FILE = '/tmp/SHUTDOWN'
+_CHECK_INTERRUPT_CMD = 'test -f {} && echo SHUTDOWN'.format(_SHUTDOWN_FILE)
+_SHUTDOWN_SCRIPT = '#! /bin/bash\n> touch {}\n> sleep 60'.format(_SHUTDOWN_FILE)
 
 
 class GceUnexpectedWindowsAdapterOutputError(Exception):
@@ -473,6 +475,9 @@ class GceVirtualMachine(virtual_machine.BaseVirtualMachine):
         continue
       metadata[key] = value
 
+    if self.preemptible:
+      metadata['shutdown-script'] = _SHUTDOWN_SCRIPT
+      cmd.flags['preemptible'] = True
     cmd.flags['metadata'] = util.FormatTags(metadata)
 
     # TODO(user): If GCE one day supports live migration on GPUs
@@ -488,8 +493,6 @@ class GceVirtualMachine(virtual_machine.BaseVirtualMachine):
         FLAGS.gce_ssd_interface)] * self.max_local_disks)
     if FLAGS.gcloud_scopes:
       cmd.flags['scopes'] = ','.join(re.split(r'[,; ]', FLAGS.gcloud_scopes))
-    if self.preemptible:
-      cmd.flags['preemptible'] = True
     cmd.flags['network-tier'] = self.gce_network_tier.upper()
 
     return cmd
@@ -775,19 +778,8 @@ class GceVirtualMachine(virtual_machine.BaseVirtualMachine):
   def UpdateInterruptibleVmStatus(self):
     """Updates the interruptible status if the VM was preempted."""
     if self.preemptible:
-      # Drop zone since compute operations list takes 'zones', not 'zone', and
-      # the argument is deprecated in favor of --filter.
-      vm_without_zone = copy.copy(self)
-      vm_without_zone.zone = None
-      gcloud_command = util.GcloudCommand(vm_without_zone, 'compute',
-                                          'operations', 'list')
-      gcloud_command.flags['filter'] = 'zone:%s targetLink.scope():%s' % (
-          self.zone, self.name)
-      gcloud_command.additional_flags.append('--log-http')
-      stdout, _, _ = gcloud_command.Issue()
-      self.early_termination = any(
-          operation['operationType'] == 'compute.instances.preempted'
-          for operation in json.loads(stdout))
+      stdout, _, = self.RemoteCommand(_CHECK_INTERRUPT_CMD)
+      self.early_termination = stdout.strip() == 'SHUTDOWN'
 
   def IsInterruptible(self):
     """Returns whether this vm is an interruptible vm (spot vm).

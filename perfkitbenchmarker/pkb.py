@@ -69,6 +69,7 @@ from os.path import isfile
 import random
 import re
 import sys
+import threading
 import time
 import uuid
 
@@ -382,6 +383,7 @@ flags.DEFINE_bool('randomize_run_order', False,
                   'randomize order of the benchmarks.')
 
 _TEARDOWN_EVENT = multiprocessing.Event()
+_VM_INTERRUPT_POLLING_INTERVAL_SECONDS = 5
 
 events.initialization_complete.connect(traces.RegisterAll)
 
@@ -646,6 +648,43 @@ def DoProvisionPhase(spec, timer):
     spec.Pickle()
 
 
+def _CheckInterrupt(wait_event, phase_status, vm):
+  """Check interrupt."""
+  while True:
+    vm.UpdateInterruptibleVmStatus()
+    if vm.WasInterrupted() or phase_status['is_done']:
+      return
+    else:
+      wait_event.wait(_VM_INTERRUPT_POLLING_INTERVAL_SECONDS)
+
+
+def _StartCheckInterruptThread(vms, phase_status):
+  """Start check interrupt thread."""
+  check_threads = []
+  wait_events = []
+  for vm in vms:
+    if vm.IsInterruptible() and not vm.WasInterrupted():
+      wait_event = threading.Event()
+      wait_events.append(wait_event)
+      check_thread = threading.Thread(target=_CheckInterrupt,
+                                      args=(wait_event, phase_status, vm))
+      check_thread.start()
+      check_threads.append(check_thread)
+  return check_threads, wait_events
+
+
+def _EndCheckInterruptThread(vms, check_threads, wait_events):
+  """End check interrupt thread."""
+  for wait_event in wait_events:
+    wait_event.set()
+
+  for check_thread in check_threads:
+    check_thread.join()
+
+  if any(vm.IsInterruptible() and vm.WasInterrupted() for vm in vms):
+    raise errors.Benchmarks.InsufficientCapacityCloudFailure('Interrupt')
+
+
 def DoPreparePhase(spec, timer):
   """Performs the Prepare phase of benchmark execution.
 
@@ -654,6 +693,10 @@ def DoPreparePhase(spec, timer):
     timer: An IntervalTimer that measures the start and stop times of the
       benchmark module's Prepare function.
   """
+  phase_status = {'is_done': False}
+  check_threads, wait_events = _StartCheckInterruptThread(spec.vms,
+                                                          phase_status)
+
   logging.info('Preparing benchmark %s', spec.name)
   with timer.Measure('BenchmarkSpec Prepare'):
     spec.Prepare()
@@ -665,6 +708,9 @@ def DoPreparePhase(spec, timer):
                  FLAGS.after_prepare_sleep_time)
     time.sleep(FLAGS.after_prepare_sleep_time)
 
+  phase_status['is_done'] = True
+  _EndCheckInterruptThread(spec.vms, check_threads, wait_events)
+
 
 def DoRunPhase(spec, collector, timer):
   """Performs the Run phase of benchmark execution.
@@ -675,6 +721,10 @@ def DoRunPhase(spec, collector, timer):
     timer: An IntervalTimer that measures the start and stop times of the
       benchmark module's Run function.
   """
+  phase_status = {'is_done': False}
+  check_threads, wait_events = _StartCheckInterruptThread(spec.vms,
+                                                          phase_status)
+
   deadline = time.time() + FLAGS.run_stage_time
   run_number = 0
   consecutive_failures = 0
@@ -733,6 +783,9 @@ def DoRunPhase(spec, collector, timer):
         time.sleep(FLAGS.after_run_sleep_time)
       break
 
+  phase_status['is_done'] = True
+  _EndCheckInterruptThread(spec.vms, check_threads, wait_events)
+
 
 def DoCleanupPhase(spec, timer):
   """Performs the Cleanup phase of benchmark execution.
@@ -745,6 +798,10 @@ def DoCleanupPhase(spec, timer):
     timer: An IntervalTimer that measures the start and stop times of the
       benchmark module's Cleanup function.
   """
+  phase_status = {'is_done': False}
+  check_threads, wait_events = _StartCheckInterruptThread(spec.vms,
+                                                          phase_status)
+
   if FLAGS.before_cleanup_pause:
     six.moves.input('Hit enter to begin cleanup.')
   logging.info('Cleaning up benchmark %s', spec.name)
@@ -753,6 +810,9 @@ def DoCleanupPhase(spec, timer):
     spec.StopBackgroundWorkload()
     with timer.Measure('Benchmark Cleanup'):
       spec.BenchmarkCleanup(spec)
+
+  phase_status['is_done'] = True
+  _EndCheckInterruptThread(spec.vms, check_threads, wait_events)
 
 
 def DoTeardownPhase(spec, timer):

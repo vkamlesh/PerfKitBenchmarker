@@ -2,6 +2,8 @@
 
 ### New features:
 
+-   Catch preemptible instance's interrupt event.
+
 ### Enhancements:
 
 -   Enable support for AWS's c6g and r6g families.
